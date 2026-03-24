@@ -8,11 +8,52 @@
 import SwiftUI
 import PencilKit
 
+// MARK: - No-Edit-Menu PKCanvasView
+
+/// PKCanvasView subclass that aggressively suppresses the "Select All | Insert Space" menu.
+/// That menu comes from Scribble (handwriting recognition), edit menus, and text interactions
+/// that PencilKit or iOS adds to the canvas.
+class CleanCanvasView: PKCanvasView {
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        return false
+    }
+
+    override func buildMenu(with builder: UIMenuBuilder) {
+        builder.remove(menu: .lookup)
+        builder.remove(menu: .standardEdit)
+        builder.remove(menu: .format)
+        super.buildMenu(with: builder)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        stripUnwantedInteractions()
+    }
+
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        stripUnwantedInteractions()
+    }
+
+    private func stripUnwantedInteractions() {
+        // Remove edit menus, text interactions, and Scribble interactions
+        for interaction in interactions {
+            let typeName = String(describing: type(of: interaction))
+            if interaction is UIEditMenuInteraction
+                || typeName.contains("Scribble")
+                || typeName.contains("TextInteraction")
+                || typeName.contains("IndirectScribble") {
+                removeInteraction(interaction)
+            }
+        }
+    }
+}
+
 // MARK: - Canvas Manager
 
 @Observable
 class CanvasManager {
-    let canvasView: PKCanvasView
+    let canvasView: CleanCanvasView
     var currentTool: ToolType = .pen
     var currentColor: UIColor = .systemBlue
 
@@ -21,19 +62,13 @@ class CanvasManager {
     }
 
     init() {
-        canvasView = PKCanvasView()
+        canvasView = CleanCanvasView()
         canvasView.backgroundColor = .clear
         canvasView.isOpaque = false
         canvasView.drawingPolicy = .pencilOnly
         canvasView.tool = PKInkingTool(.pen, color: .systemBlue, width: 2)
         canvasView.isScrollEnabled = false
-
-        // Suppress the "Select All | Insert Space" edit menu
-        if #available(iOS 16.0, *) {
-            canvasView.interactions
-                .filter { $0 is UIEditMenuInteraction }
-                .forEach { canvasView.removeInteraction($0) }
-        }
+        canvasView.overrideUserInterfaceStyle = .light
     }
 
     func clear() {
@@ -55,7 +90,6 @@ class CanvasManager {
         canvasView.tool = PKEraserTool(.bitmap)
     }
 
-    /// Applies the current tool settings to any PKCanvasView
     func applyCurrentTool(to canvas: PKCanvasView) {
         switch currentTool {
         case .pen:
@@ -79,8 +113,6 @@ struct PuzzleView: View {
     @State private var magnifierPanOffset: CGSize = .zero
     @State private var selectedColor: Color = .blue
     @State private var isErasing = false
-    // Incremented when drawing changes, to trigger magnifier refresh
-    @State private var drawingVersion: Int = 0
 
     private let colorOptions: [(Color, UIColor, String)] = [
         (.blue, .systemBlue, "Blue"),
@@ -195,7 +227,7 @@ struct PuzzleView: View {
 
             // Magnifier overlay
             if showMagnifier, let sourcePoint = magnifierSourcePoint {
-                MagnifierView(
+                MagnifierOverlay(
                     image: image,
                     canvasManager: canvasManager,
                     sourcePoint: CGPoint(
@@ -204,8 +236,6 @@ struct PuzzleView: View {
                     ),
                     isDragging: isDraggingMagnifier,
                     panOffset: $magnifierPanOffset,
-                    drawingVersion: drawingVersion,
-                    onDrawingChanged: { drawingVersion += 1 },
                     onDismiss: { showMagnifier = false }
                 )
             }
@@ -331,7 +361,6 @@ struct PuzzleCanvasView: UIViewRepresentable {
             imageView.frame = CGRect(origin: .zero, size: fittedSize)
             canvas.frame = CGRect(origin: .zero, size: fittedSize)
             scrollView.contentSize = fittedSize
-
             centerContent(in: scrollView)
         }
 
@@ -371,7 +400,6 @@ struct PuzzleCanvasView: UIViewRepresentable {
         @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
             guard let containerView else { return }
             let point = gesture.location(in: containerView)
-
             switch gesture.state {
             case .began:
                 onMagnifierGesture(point, .began)
@@ -387,7 +415,6 @@ struct PuzzleCanvasView: UIViewRepresentable {
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
             guard let scrollView = gesture.view as? UIScrollView else { return }
             if scrollView.zoomScale > scrollView.minimumZoomScale + 0.1 {
-                // Zoom out to fit
                 resetToFit(scrollView: scrollView)
             } else {
                 let point = gesture.location(in: containerView)
@@ -398,16 +425,14 @@ struct PuzzleCanvasView: UIViewRepresentable {
     }
 }
 
-// MARK: - Magnifier View
+// MARK: - Magnifier Overlay
 
-struct MagnifierView: View {
+struct MagnifierOverlay: View {
     let image: UIImage
     let canvasManager: CanvasManager
     let sourcePoint: CGPoint
     let isDragging: Bool
     @Binding var panOffset: CGSize
-    let drawingVersion: Int
-    let onDrawingChanged: () -> Void
     let onDismiss: () -> Void
 
     @GestureState private var dragTranslation: CGSize = .zero
@@ -422,15 +447,13 @@ struct MagnifierView: View {
                     }
 
                 VStack {
-                    MagnifiedCanvasView(
+                    MagnifierCanvasView(
                         image: image,
                         canvasManager: canvasManager,
                         sourcePoint: CGPoint(
                             x: sourcePoint.x - dragTranslation.width * 0.5,
                             y: sourcePoint.y - dragTranslation.height * 0.5
-                        ),
-                        drawingVersion: drawingVersion,
-                        onDrawingChanged: onDrawingChanged
+                        )
                     )
                     .frame(
                         width: geo.size.width - 60,
@@ -472,67 +495,82 @@ struct MagnifierView: View {
     }
 }
 
-// MARK: - Magnified Canvas (image + drawing overlay + drawable PKCanvasView)
+// MARK: - Magnifier Canvas View
+//
+// Uses a full-size canvas in main-canvas coordinates, zoomed and clipped
+// to show the magnified region. Strokes are 1:1 with the main canvas —
+// no coordinate transformation needed.
 
-struct MagnifiedCanvasView: UIViewRepresentable {
+/// Custom clip view that re-lays-out content whenever its bounds change
+/// (which happens when SwiftUI assigns the final .frame() size).
+class MagnifierClipView: UIView {
+    var layoutHandler: ((CGRect) -> Void)?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.width > 0 && bounds.height > 0 {
+            layoutHandler?(bounds)
+        }
+    }
+}
+
+struct MagnifierCanvasView: UIViewRepresentable {
     let image: UIImage
     let canvasManager: CanvasManager
     let sourcePoint: CGPoint
-    let drawingVersion: Int
-    let onDrawingChanged: () -> Void
 
-    // The region of the original image we're showing
-    static let regionWidth: CGFloat = 300
-    static let regionHeight: CGFloat = 180
-    static let renderScale: CGFloat = 3
+    func makeUIView(context: Context) -> MagnifierClipView {
+        let clipView = MagnifierClipView()
+        clipView.clipsToBounds = true
 
-    func makeUIView(context: Context) -> UIView {
-        let container = UIView()
-        container.clipsToBounds = true
+        let contentView = UIView()
+        context.coordinator.contentView = contentView
 
-        // Background image view (shows the magnified region)
-        let bgImageView = UIImageView()
-        bgImageView.contentMode = .scaleAspectFill
-        bgImageView.clipsToBounds = true
-        container.addSubview(bgImageView)
-        context.coordinator.bgImageView = bgImageView
+        let imageView = UIImageView(image: image)
+        imageView.contentMode = .scaleAspectFit
+        context.coordinator.imageView = imageView
 
-        // Drawing canvas overlay for the magnifier
-        let magnifierCanvas = PKCanvasView()
-        magnifierCanvas.backgroundColor = .clear
-        magnifierCanvas.isOpaque = false
-        magnifierCanvas.drawingPolicy = .pencilOnly
-        magnifierCanvas.isScrollEnabled = false
-        magnifierCanvas.delegate = context.coordinator
-        canvasManager.applyCurrentTool(to: magnifierCanvas)
-
-        container.addSubview(magnifierCanvas)
-        context.coordinator.magnifierCanvas = magnifierCanvas
+        let magCanvas = CleanCanvasView()
+        magCanvas.backgroundColor = .clear
+        magCanvas.isOpaque = false
+        magCanvas.drawingPolicy = .pencilOnly
+        magCanvas.isScrollEnabled = false
+        magCanvas.overrideUserInterfaceStyle = .light
+        magCanvas.delegate = context.coordinator
+        context.coordinator.magCanvas = magCanvas
         context.coordinator.canvasManager = canvasManager
         context.coordinator.image = image
-        context.coordinator.onDrawingChanged = onDrawingChanged
 
-        return container
+        contentView.addSubview(imageView)
+        contentView.addSubview(magCanvas)
+        clipView.addSubview(contentView)
+
+        // Sync drawing from main canvas once on creation
+        magCanvas.drawing = canvasManager.canvasView.drawing
+
+        // Re-layout whenever the clip view gets its real bounds
+        let coord = context.coordinator
+        clipView.layoutHandler = { [weak coord] bounds in
+            coord?.layoutMagnifier(clipBounds: bounds)
+        }
+
+        return clipView
     }
 
-    func updateUIView(_ container: UIView, context: Context) {
+    func updateUIView(_ clipView: MagnifierClipView, context: Context) {
         let coord = context.coordinator
         coord.sourcePoint = sourcePoint
-        coord.image = image
 
-        let bounds = container.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
-
-        coord.bgImageView?.frame = bounds
-        coord.magnifierCanvas?.frame = bounds
-
-        // Apply current tool to magnifier canvas
-        if let mc = coord.magnifierCanvas {
+        // Apply current tool
+        if let mc = coord.magCanvas {
             canvasManager.applyCurrentTool(to: mc)
         }
 
-        // Render the magnified background
-        coord.bgImageView?.image = coord.renderBackground(viewSize: bounds.size)
+        // Trigger layout with current bounds
+        let clipBounds = clipView.bounds
+        if clipBounds.width > 0 && clipBounds.height > 0 {
+            coord.layoutMagnifier(clipBounds: clipBounds)
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -540,81 +578,70 @@ struct MagnifiedCanvasView: UIViewRepresentable {
     }
 
     class Coordinator: NSObject, PKCanvasViewDelegate {
-        var bgImageView: UIImageView?
-        var magnifierCanvas: PKCanvasView?
+        var contentView: UIView?
+        var imageView: UIImageView?
+        var magCanvas: CleanCanvasView?
         var canvasManager: CanvasManager?
         var image: UIImage?
         var sourcePoint: CGPoint = .zero
-        var onDrawingChanged: (() -> Void)?
-        private var isTransferring = false
+        var isTransferring = false
+        private var lastSetupBounds: CGRect = .zero
 
-        func renderBackground(viewSize: CGSize) -> UIImage? {
-            guard let image, let mainCanvas = canvasManager?.canvasView else { return nil }
-            let canvasFrame = mainCanvas.frame
-            guard canvasFrame.width > 0, canvasFrame.height > 0 else { return nil }
+        func layoutMagnifier(clipBounds: CGRect) {
+            guard let image, let canvasManager, let contentView, let imageView, let magCanvas else { return }
+            guard clipBounds.width > 0, clipBounds.height > 0 else { return }
 
-            let rw = MagnifiedCanvasView.regionWidth
-            let rh = MagnifiedCanvasView.regionHeight
-            let cropRect = CGRect(
-                x: sourcePoint.x - rw / 2,
-                y: sourcePoint.y - rh / 2,
-                width: rw,
-                height: rh
-            )
-
-            let scale = MagnifiedCanvasView.renderScale
-            let rendererSize = CGSize(width: rw * scale, height: rh * scale)
-            let renderer = UIGraphicsImageRenderer(size: rendererSize)
-            return renderer.image { ctx in
-                ctx.cgContext.scaleBy(x: scale, y: scale)
-                ctx.cgContext.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
-                image.draw(in: CGRect(origin: .zero, size: canvasFrame.size))
-                let drawingImage = mainCanvas.drawing.image(from: mainCanvas.bounds, scale: 3.0)
-                drawingImage.draw(in: CGRect(origin: .zero, size: canvasFrame.size))
+            // Get the main canvas size
+            let mainCanvas = canvasManager.canvasView
+            let mainFrame = mainCanvas.frame
+            let canvasSize: CGSize
+            if mainFrame.width > 0 && mainFrame.height > 0 {
+                canvasSize = mainFrame.size
+            } else {
+                let imageSize = image.size
+                let fitScale = min(clipBounds.width / imageSize.width, clipBounds.height / imageSize.height)
+                canvasSize = CGSize(width: imageSize.width * fitScale, height: imageSize.height * fitScale)
             }
+
+            // Zoom: a 300pt-wide region fills the clip view
+            let regionWidth: CGFloat = 300
+            let zoomScale = clipBounds.width / regionWidth
+
+            // Only re-setup subview sizes if clip bounds changed
+            if lastSetupBounds.size != clipBounds.size {
+                lastSetupBounds = clipBounds
+
+                // Set anchor point to top-left for predictable positioning
+                imageView.layer.anchorPoint = .zero
+                magCanvas.layer.anchorPoint = .zero
+
+                // Set subviews at original canvas size with scale transform
+                imageView.transform = .identity
+                imageView.bounds = CGRect(origin: .zero, size: canvasSize)
+                imageView.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
+                imageView.layer.position = .zero
+
+                magCanvas.transform = .identity
+                magCanvas.bounds = CGRect(origin: .zero, size: canvasSize)
+                magCanvas.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
+                magCanvas.layer.position = .zero
+            }
+
+            // Position content view so sourcePoint is centered in clip view
+            let scaledSize = CGSize(width: canvasSize.width * zoomScale, height: canvasSize.height * zoomScale)
+            let originX = clipBounds.width / 2 - sourcePoint.x * zoomScale
+            let originY = clipBounds.height / 2 - sourcePoint.y * zoomScale
+
+            contentView.frame = CGRect(origin: CGPoint(x: originX, y: originY), size: scaledSize)
         }
 
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
             guard !isTransferring else { return }
-            guard let canvasManager, let magnifierCanvas else { return }
+            guard let canvasManager, let magCanvas else { return }
 
-            let mainCanvas = canvasManager.canvasView
-            let mainFrame = mainCanvas.frame
-            guard mainFrame.width > 0, mainFrame.height > 0 else { return }
-
-            let magBounds = magnifierCanvas.bounds
-            guard magBounds.width > 0, magBounds.height > 0 else { return }
-
-            let rw = MagnifiedCanvasView.regionWidth
-            let rh = MagnifiedCanvasView.regionHeight
-
-            // Transform from magnifier coordinates to main canvas coordinates
-            let scaleX = rw / magBounds.width
-            let scaleY = rh / magBounds.height
-            let offsetX = sourcePoint.x - rw / 2
-            let offsetY = sourcePoint.y - rh / 2
-
-            let transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
-                .translatedBy(x: offsetX / scaleX, y: offsetY / scaleY)
-
-            let transformedDrawing = magnifierCanvas.drawing.transformed(using: transform)
-
-            // Merge into main canvas
             isTransferring = true
-            var combined = mainCanvas.drawing
-            combined.append(transformedDrawing)
-            mainCanvas.drawing = combined
-
-            // Clear the magnifier canvas
-            magnifierCanvas.drawing = PKDrawing()
+            canvasManager.canvasView.drawing = magCanvas.drawing
             isTransferring = false
-
-            // Refresh the background to show the new strokes
-            if let bgImageView, magBounds.width > 0 {
-                bgImageView.image = renderBackground(viewSize: magBounds.size)
-            }
-
-            onDrawingChanged?()
         }
     }
 }
