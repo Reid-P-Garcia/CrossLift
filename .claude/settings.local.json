@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/reidmbp/Documents/_Reid''''''''s Documents/Cursor Code Files/Crossword-App/**)",
+      "Bash(xcodebuild -scheme CrossLift -destination 'platform=iOS Simulator,name=iPad Pro 13-inch \\(M4\\)' build)",
+      "Bash(xcodebuild -scheme CrossLift -destination 'platform=iOS Simulator,name=iPad Pro 13-inch \\(M5\\)' build)",
+      "Bash(gh auth:*)",
+      "Bash(brew --version)"
+    ]
+  }
+}
